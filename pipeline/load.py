@@ -139,7 +139,11 @@ def save_rejected(cur, rejected: pd.DataFrame) -> None:
     execute_values(cur, f"""
         INSERT INTO rejected_orders ({", ".join(cols)}) VALUES %s
         ON CONFLICT (source_file, source_row) DO UPDATE SET
-            order_id = EXCLUDED.order_id, reason = EXCLUDED.reason
+            order_id = EXCLUDED.order_id, reason = EXCLUDED.reason,
+            order_ts = EXCLUDED.order_ts, customer_id = EXCLUDED.customer_id,
+            product_id = EXCLUDED.product_id, quantity = EXCLUDED.quantity,
+            unit_price = EXCLUDED.unit_price, status = EXCLUDED.status,
+            rejected_at = now()
     """, _rows(rejected[cols]))
 
 
