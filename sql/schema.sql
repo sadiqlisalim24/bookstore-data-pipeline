@@ -56,7 +56,7 @@ CREATE INDEX IF NOT EXISTS ix_fact_orders_product ON fact_orders (product_id);
 -- Təmizləmədən keçməyən sətirlər silinmir, səbəbi ilə birlikdə burada saxlanılır.
 CREATE TABLE IF NOT EXISTS rejected_orders (
     source_file  TEXT NOT NULL,
-    source_row   INTEGER NOT NULL,                -- fayldakı sətir nömrəsi (başlıq = 1)
+    source_row   INTEGER NOT NULL,                -- məlumat sətrinin sıra nömrəsi (başlıqsız, boş sətirlər sayılmır)
     order_id     TEXT,
     reason       TEXT NOT NULL,
     order_ts     TEXT,

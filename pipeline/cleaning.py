@@ -124,8 +124,8 @@ def clean_orders(raw: pd.DataFrame, source_file: str) -> tuple[pd.DataFrame, pd.
     df = raw.copy()
     for col in ["order_id", "customer_id", "product_id", "status"]:
         df[col] = df[col].str.strip()
-    # Fayldakı sətir nömrəsi (başlıq = 1-ci sətir). Karantində sətri tapmaq üçün.
-    df["source_row"] = df.index + 2
+    # Məlumat sətrinin sıra nömrəsi (başlıqdan sonra 1-dən; pandas boş sətirləri saymır).
+    df["source_row"] = df.index + 1
 
     before = len(df)
     df = df.drop_duplicates(subset=list(raw.columns), keep="last")

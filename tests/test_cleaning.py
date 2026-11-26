@@ -87,8 +87,8 @@ def test_clean_orders_rejects_blank_ids_fractional_qty_and_bad_price():
     assert list(clean["order_id"]) == ["O3"]
     assert clean.loc[0, "quantity"] == 2
     reasons = dict(zip(rejected["source_row"], rejected["reason"]))
-    assert reasons == {2: "missing_order_id", 3: "missing_order_id",
-                       4: "invalid_quantity", 5: "invalid_price"}
+    assert reasons == {1: "missing_order_id", 2: "missing_order_id",
+                       3: "invalid_quantity", 4: "invalid_price"}
 
 
 def test_clean_orders_keeps_last_row_for_repeated_order():
