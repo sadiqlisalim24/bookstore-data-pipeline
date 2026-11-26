@@ -1,7 +1,10 @@
-"""İnteqrasiya testləri: işləyən PostgreSQL tələb edir (DATABASE_URL).
+"""İnteqrasiya testləri: ayrıca test bazası tələb edir (TEST_DATABASE_URL).
 
-Baza yoxdursa testlər ötürülür (skip).
+Testlər cədvəlləri silib yenidən yaradır, ona görə əsas DATABASE_URL heç vaxt
+istifadə olunmur. TEST_DATABASE_URL verilməyibsə və ya baza əlçatan deyilsə, skip.
 """
+import os
+
 import psycopg2
 import pytest
 
@@ -12,11 +15,15 @@ from pipeline.db import connect, drop_schema
 
 @pytest.fixture(scope="module")
 def conn():
+    url = os.getenv("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("TEST_DATABASE_URL verilməyib")
     try:
-        c = connect(retries=1)
+        c = connect(url, retries=1)
     except psycopg2.OperationalError:
-        pytest.skip("PostgreSQL əlçatan deyil")
+        pytest.skip("Test bazası əlçatan deyil")
     drop_schema(c)
+    c.commit()
     yield c
     c.close()
 
@@ -56,3 +63,36 @@ def test_reloading_old_file_does_not_revert_status(conn):
     after_incremental = snapshot(conn)
     load.full_load(conn)
     assert snapshot(conn) == after_incremental
+
+
+def order_status(conn, order_id):
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, source_file FROM fact_orders WHERE order_id = %s", (order_id,))
+        return cur.fetchone()
+
+
+def test_unchanged_newer_file_protects_from_older_file(conn, tmp_path):
+    header = "order_id,order_ts,customer_id,product_id,quantity,unit_price,status\n"
+    row = "O000610,12.10.2026 00:18,{c},{p},{q},{u},{s}\n"
+    with conn.cursor() as cur:
+        cur.execute("SELECT customer_id, product_id, quantity, unit_price FROM fact_orders "
+                    "WHERE order_id = 'O000610'")
+        c, p, q, u = cur.fetchone()
+    newer = tmp_path / "orders_2026_12_01.csv"
+    newer.write_text(header + row.format(c=c, p=p, q=q, u=u, s="refunded"))
+    load.incremental_load(conn, newer)
+    assert order_status(conn, "O000610") == ("refunded", newer.name)
+
+    older = tmp_path / "orders_2026_11_15.csv"
+    older.write_text(header + row.format(c=c, p=p, q=q, u=u, s="completed"))
+    load.incremental_load(conn, older)
+    assert order_status(conn, "O000610") == ("refunded", newer.name)
+
+
+def test_failed_reset_keeps_existing_tables(conn, tmp_path):
+    before = snapshot(conn)
+    drop_schema(conn)
+    with pytest.raises(FileNotFoundError):
+        load.full_load(conn, data_dir=tmp_path)  # boş qovluq: fayllar yoxdur
+    conn.rollback()
+    assert snapshot(conn) == before

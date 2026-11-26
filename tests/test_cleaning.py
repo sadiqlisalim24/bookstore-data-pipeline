@@ -12,6 +12,8 @@ def test_parse_price_formats():
     assert parse_price("25,00") == 25.0
     assert parse_price("12.5 AZN") == 12.5
     assert parse_price("") is None
+    assert parse_price("N/A") is None
+    assert parse_price("inf") is None
 
 
 def test_parse_dates_day_first():
@@ -69,3 +71,35 @@ def test_clean_orders_rules():
     assert clean.loc[1, "customer_id"] is None
     assert list(rejected["order_id"]) == ["O3"]
     assert rejected.loc[0, "reason"] == "non_positive_quantity"
+
+
+def test_clean_orders_rejects_blank_ids_fractional_qty_and_bad_price():
+    raw = pd.DataFrame({
+        "order_id": ["", "", "O1", "O2", "O3"],
+        "order_ts": ["2026-08-01 10:00:00"] * 5,
+        "customer_id": ["C1"] * 5,
+        "product_id": ["P1"] * 5,
+        "quantity": ["1", "2", "2.5", "1", "2.0"],
+        "unit_price": ["10.00", "20.00", "10.00", "N/A", "10.00"],
+        "status": ["completed"] * 5,
+    })
+    clean, rejected = clean_orders(raw, "test.csv")
+    assert list(clean["order_id"]) == ["O3"]
+    assert clean.loc[0, "quantity"] == 2
+    reasons = dict(zip(rejected["source_row"], rejected["reason"]))
+    assert reasons == {2: "missing_order_id", 3: "missing_order_id",
+                       4: "invalid_quantity", 5: "invalid_price"}
+
+
+def test_clean_orders_keeps_last_row_for_repeated_order():
+    raw = pd.DataFrame({
+        "order_id": ["O1", "O1", "O1"],
+        "order_ts": ["2026-08-01 10:00:00"] * 3,
+        "customer_id": ["C1"] * 3,
+        "product_id": ["P1"] * 3,
+        "quantity": ["1"] * 3,
+        "unit_price": ["10.00"] * 3,
+        "status": ["completed", "refunded", "completed"],
+    })
+    clean, _ = clean_orders(raw, "test.csv")
+    assert list(clean["status"]) == ["completed"]

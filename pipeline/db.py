@@ -5,11 +5,11 @@ import psycopg2
 from pipeline.config import DATABASE_URL, SQL_DIR
 
 
-def connect(retries: int = 10, delay: float = 2.0):
+def connect(url: str = DATABASE_URL, retries: int = 10, delay: float = 2.0):
     """Bazaya qoşulur. Docker-də Postgres gec qalxa bilər, ona görə bir neçə dəfə cəhd edir."""
     for attempt in range(1, retries + 1):
         try:
-            return psycopg2.connect(DATABASE_URL)
+            return psycopg2.connect(url)
         except psycopg2.OperationalError:
             if attempt == retries:
                 raise
@@ -22,8 +22,11 @@ def create_schema(conn) -> None:
 
 
 def drop_schema(conn) -> None:
-    """Bütün cədvəlləri silir (yalnız --reset ilə, təmiz başlanğıc üçün)."""
+    """Bütün cədvəlləri silir (yalnız --reset ilə, təmiz başlanğıc üçün).
+
+    Burada commit yoxdur: silmə və sonrakı yükləmə eyni tranzaksiyadadır.
+    Yükləmə uğursuz olsa, rollback köhnə cədvəlləri geri qaytarır.
+    """
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS fact_orders, rejected_orders, dim_customer, "
                     "dim_product, dim_date CASCADE")
-    conn.commit()

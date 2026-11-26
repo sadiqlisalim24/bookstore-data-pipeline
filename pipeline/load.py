@@ -93,15 +93,15 @@ def upsert_dates(cur, orders: pd.DataFrame) -> None:
 
 
 def upsert_orders(cur, orders: pd.DataFrame) -> tuple[int, int]:
-    """Sifarişləri yükləyir. (yeni, yenilənmiş) sayını qaytarır.
+    """Sifarişləri yükləyir. (yeni, dəyişmiş) sayını qaytarır.
 
-    Mövcud sifariş yalnız iki şərtlə yenilənir:
-      1) nəsə həqiqətən dəyişibsə (status və s.);
-      2) gələn fayl köhnə fayldan "yeni"dirsə (fayl adları tarixlə adlanır və
-         əlifba sırası = xronoloji sıra). Beləliklə köhnə fayl təkrar yüklənəndə
-         yeni statusu geri qaytarmır.
-    RETURNING (xmax = 0) Postgres-də sətrin yeni əlavə olunduğunu (TRUE)
-    və ya yeniləndiyini (FALSE) göstərir.
+    Mövcud sifariş yalnız gələn fayl saxlanılan fayldan köhnə deyilsə yenilənir
+    (fayl adları tarixlə adlanır, əlifba sırası = xronoloji sıra). Beləliklə köhnə
+    fayl təkrar yüklənəndə yeni statusu geri qaytarmır. source_file hər dəfə ən
+    yeni fayla keçir, updated_at isə yalnız məlumat həqiqətən dəyişəndə yenilənir.
+
+    RETURNING: xmax = 0 sətrin yeni əlavə olunduğunu göstərir; updated_at = now()
+    isə bu tranzaksiyada dəyişdiyini (now() tranzaksiya boyu sabitdir).
     """
     df = orders.assign(date_key=orders["order_ts"].dt.strftime("%Y%m%d").astype(int))
     cols = ["order_id", "order_ts", "date_key", "customer_id", "product_id",
@@ -115,28 +115,31 @@ def upsert_orders(cur, orders: pd.DataFrame) -> tuple[int, int]:
             customer_id = EXCLUDED.customer_id, product_id = EXCLUDED.product_id,
             quantity = EXCLUDED.quantity, unit_price = EXCLUDED.unit_price,
             status = EXCLUDED.status, source_file = EXCLUDED.source_file,
-            updated_at = now()
+            updated_at = CASE
+                WHEN (fact_orders.order_ts, fact_orders.customer_id, fact_orders.product_id,
+                      fact_orders.quantity, fact_orders.unit_price, fact_orders.status)
+                     IS DISTINCT FROM
+                     (EXCLUDED.order_ts, EXCLUDED.customer_id, EXCLUDED.product_id,
+                      EXCLUDED.quantity, EXCLUDED.unit_price, EXCLUDED.status)
+                THEN now() ELSE fact_orders.updated_at END
         WHERE EXCLUDED.source_file >= fact_orders.source_file
-          AND (fact_orders.order_ts, fact_orders.customer_id, fact_orders.product_id,
-               fact_orders.quantity, fact_orders.unit_price, fact_orders.status)
-              IS DISTINCT FROM
-              (EXCLUDED.order_ts, EXCLUDED.customer_id, EXCLUDED.product_id,
-               EXCLUDED.quantity, EXCLUDED.unit_price, EXCLUDED.status)
-        RETURNING (xmax = 0)
+        RETURNING (xmax = 0), (updated_at = now())
     """, [tuple(r) for r in df[cols].astype(object).where(df[cols].notna(), None).values],
         fetch=True, page_size=1000)
-    inserted = sum(1 for (is_new,) in result if is_new)
-    return inserted, len(result) - inserted
+    inserted = sum(1 for is_new, _ in result if is_new)
+    changed = sum(1 for is_new, is_changed in result if is_changed and not is_new)
+    return inserted, changed
 
 
 def save_rejected(cur, rejected: pd.DataFrame) -> None:
     if rejected.empty:
         return
-    cols = ["order_id", "source_file", "reason", "order_ts", "customer_id",
+    cols = ["source_file", "source_row", "order_id", "reason", "order_ts", "customer_id",
             "product_id", "quantity", "unit_price", "status"]
     execute_values(cur, f"""
         INSERT INTO rejected_orders ({", ".join(cols)}) VALUES %s
-        ON CONFLICT (order_id, source_file) DO UPDATE SET reason = EXCLUDED.reason
+        ON CONFLICT (source_file, source_row) DO UPDATE SET
+            order_id = EXCLUDED.order_id, reason = EXCLUDED.reason
     """, _rows(rejected[cols]))
 
 
@@ -144,9 +147,11 @@ def load_orders_file(conn, path: Path) -> None:
     raw = read_csv(path)
     orders, rejected = cleaning.clean_orders(raw, path.name)
     with conn.cursor() as cur:
-        add_unknown_members(cur, orders)
-        upsert_dates(cur, orders)
-        inserted, updated = upsert_orders(cur, orders)
+        inserted = updated = 0
+        if not orders.empty:
+            add_unknown_members(cur, orders)
+            upsert_dates(cur, orders)
+            inserted, updated = upsert_orders(cur, orders)
         save_rejected(cur, rejected)
     log.info("%s: oxundu %s, yeni %s, yeniləndi %s, rədd edildi %s",
              path.name, len(raw), inserted, updated, len(rejected))

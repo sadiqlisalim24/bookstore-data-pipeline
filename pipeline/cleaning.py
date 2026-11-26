@@ -6,6 +6,7 @@ təmiz DataFrame qaytarır. Bu, qaydaları ayrıca test etməyi asanlaşdırır.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime
 
 import pandas as pd
@@ -55,11 +56,13 @@ def parse_datetime(value: str, formats: list[str]) -> datetime | None:
 
 
 def parse_price(value: str) -> float | None:
-    """'22 AZN', '25,00', '6.00' -> 22.0, 25.0, 6.0. Boş dəyər -> None."""
+    """'22 AZN', '25,00', '6.00' -> 22.0, 25.0, 6.0. Boş və ya oxunmayan dəyər -> None."""
     value = value.upper().replace("AZN", "").replace(",", ".").strip()
-    if not value:
+    try:
+        price = float(value)
+    except ValueError:
         return None
-    return round(float(value), 2)
+    return round(price, 2) if math.isfinite(price) else None
 
 
 def _map_values(series: pd.Series, mapping: dict[str, str], name: str) -> pd.Series:
@@ -105,7 +108,8 @@ def clean_products(raw: pd.DataFrame, orders_raw: pd.DataFrame | None = None) ->
     missing = df["list_price"].isna()
     if missing.any() and orders_raw is not None:
         prices = orders_raw.assign(unit_price=orders_raw["unit_price"].map(parse_price))
-        mode = prices.groupby("product_id")["unit_price"].agg(lambda s: s.mode().iloc[0])
+        mode = prices.dropna(subset=["unit_price"]).groupby("product_id")["unit_price"].agg(
+            lambda s: s.mode().iloc[0])
         df.loc[missing, "list_price"] = df.loc[missing, "product_id"].map(mode)
         log.info("Qiyməti boş olan məhsullar sifarişlərdən dolduruldu: %s",
                  df.loc[missing, "product_id"].tolist())
@@ -120,13 +124,17 @@ def clean_orders(raw: pd.DataFrame, source_file: str) -> tuple[pd.DataFrame, pd.
     df = raw.copy()
     for col in ["order_id", "customer_id", "product_id", "status"]:
         df[col] = df[col].str.strip()
+    # Fayldakı sətir nömrəsi (başlıq = 1-ci sətir). Karantində sətri tapmaq üçün.
+    df["source_row"] = df.index + 2
 
     before = len(df)
-    df = df.drop_duplicates()
+    df = df.drop_duplicates(subset=list(raw.columns), keep="last")
     if before != len(df):
         log.info("%s: %s tam dublikat sətir silindi", source_file, before - len(df))
     # Eyni order_id fərqli məzmunla təkrarlanarsa, fayldakı sonuncu sətir qalır.
-    df = df.drop_duplicates("order_id", keep="last")
+    # order_id boş olan sətirlər bir-biri ilə birləşdirilmir, aşağıda karantinə düşür.
+    has_id = df["order_id"] != ""
+    df = pd.concat([df[~has_id], df[has_id].drop_duplicates("order_id", keep="last")])
 
     df["order_ts"] = df["order_ts"].map(lambda v: parse_datetime(v, TIMESTAMP_FORMATS))
     df["status"] = df["status"].str.lower()
@@ -134,15 +142,20 @@ def clean_orders(raw: pd.DataFrame, source_file: str) -> tuple[pd.DataFrame, pd.
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
     df["unit_price"] = df["unit_price"].map(parse_price)
 
+    quantity_is_whole = df["quantity"].map(lambda q: math.isfinite(q) and q == int(q))
+
     reasons = pd.Series("", index=df.index)
+    reasons[df["order_id"] == ""] += "missing_order_id;"
     reasons[df["order_ts"].isna()] += "invalid_timestamp;"
-    reasons[df["quantity"].isna() | (df["quantity"] <= 0)] += "non_positive_quantity;"
+    reasons[~quantity_is_whole] += "invalid_quantity;"
+    reasons[quantity_is_whole & (df["quantity"] <= 0)] += "non_positive_quantity;"
     reasons[df["unit_price"].isna() | (df["unit_price"] <= 0)] += "invalid_price;"
     reasons[~df["status"].isin(VALID_STATUSES)] += "invalid_status;"
     reasons[df["product_id"] == ""] += "missing_product;"
 
     bad = reasons != ""
     rejected = raw.loc[df.index[bad]].copy()
+    rejected["source_row"] = df.loc[bad, "source_row"]
     rejected["reason"] = reasons[bad].str.rstrip(";")
     rejected["source_file"] = source_file
 

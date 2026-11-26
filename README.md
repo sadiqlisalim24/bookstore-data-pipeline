@@ -42,11 +42,15 @@ python -m pipeline all --reset
 ### Testlər
 
 ```bash
-pytest -q
+pip install -r requirements.txt
+docker compose up -d db
+TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/bookstore_test pytest -q
 ```
 
 `tests/test_cleaning.py` təmizləmə qaydalarını bazasız yoxlayır. `tests/test_pipeline_db.py`
-işləyən PostgreSQL ilə idempotentliyi və inkremental yükləməni yoxlayır (baza yoxdursa skip olunur).
+idempotentliyi, inkremental yükləməni və uğursuz `--reset`-in köhnə məlumatı silməməsini yoxlayır.
+Bu testlər cədvəlləri silib yenidən yaratdığı üçün yalnız ayrıca `bookstore_test` bazasında işləyir
+(`docker/init-test-db.sql` onu yaradır). `TEST_DATABASE_URL` verilməsə, skip olunur.
 
 ## Layihənin strukturu
 
@@ -59,6 +63,7 @@ pipeline/
   report.py               sql/queries-i işə salıb Markdown cədvəli çap edir
   db.py, config.py        qoşulma və parametrlər (DATABASE_URL, DATA_DIR)
   __main__.py             komanda sətri: python -m pipeline <load|incremental|check|report|all>
+docker/init-test-db.sql   testlər üçün ayrıca baza
 sql/
   schema.sql              cədvəllər
   queries/q1..q5_*.sql    SQL sualları
@@ -94,7 +99,8 @@ Bütün qaydalar `pipeline/cleaning.py` faylındadır. Xam fayllar dəyişdirilm
 | 25 sətir tam dublikatdır (bütün sütunlar eynidir) | Sildim, sonra `order_id` üzrə də unikallığı təmin etdim | Eyni sifariş iki dəfə sayılsa, gəlir şişir |
 | `status`: `completed`, `Completed`, `COMPLETED` | Kiçik hərfə saldım. Yalnız `completed/cancelled/refunded` qəbul olunur | Qruplaşdırma üçün |
 | `order_ts` 3 formatdadır: `2026-10-28T03:29:40`, `2026-11-01 00:06:55`, `05.10.2026 22:15` | Hər formatı ayrıca oxudum, gün-ay-il qəbul etdim | 480 halda birinci rəqəm 12-dən böyükdür. Bütün tarixlər avqust–oktyabr aralığına düşür, bu da qərarı təsdiqləyir |
-| 18 sətirdə `quantity` mənfidir (-1…-4), status isə əksər hallarda `completed`-dir | Silmədim, `rejected_orders` cədvəlinə səbəbi ilə köçürdüm | Mənfi miqdar qaytarma ola bilərdi, amma qaytarmalar ayrıca `refunded` statusu ilə gəlir. Deməli bu, xəta ehtimalıdır. Gəlirə daxil etmirəm, amma itirmirəm də: biznes yoxlaya bilsin |
+| 18 sətirdə `quantity` mənfidir (-1…-4), status isə əksər hallarda `completed`-dir | Silmədim, `rejected_orders` cədvəlinə səbəbi və fayldakı sətir nömrəsi ilə köçürdüm | Mənfi miqdar qaytarma ola bilərdi, amma qaytarmalar ayrıca `refunded` statusu ilə gəlir. Deməli bu, xəta ehtimalıdır. Gəlirə daxil etmirəm, amma itirmirəm də: biznes yoxlaya bilsin |
+| Hazırkı fayllarda olmayan, amma gələcəkdə gələ biləcək hallar: boş `order_id`, kəsr miqdar (`2.5`), oxunmayan qiymət (`N/A`), oxunmayan tarix, naməlum status | Hamısı `rejected_orders`-ə düşür (`missing_order_id`, `invalid_quantity`, `invalid_price`, `invalid_timestamp`, `invalid_status`) | Bir pis sətir bütün faylın yüklənməsini dayandırmamalıdır |
 | 44 sifarişdə `customer_id` boşdur | Sifarişi saxladım, `customer_id = NULL` | Satış baş verib, gəlir realdır. Sadəcə müştəriyə/şəhərə bağlana bilmir (sual 3 və 4-də iştirak etmir, sual 1, 2, 5-də iştirak edir) |
 | 25 sifariş `P999` məhsuluna aiddir, kataloqda belə məhsul yoxdur | `dim_product`-a `is_known = FALSE` olan "Naməlum məhsul (P999)" sətri əlavə etdim | Gəlir itməsin deyə (sual 1-də daxildir). Sual 2 və 5 "kitab" haqqındadır, orada naməlum məhsul çıxarılır |
 
@@ -128,7 +134,7 @@ rejected_orders   (karantin: təmizləmədən keçməyən sətirlər)
 | `dim_customer` | Müştəri: ad, standart şəhər, qeydiyyat tarixi, e-poçt, `is_known` |
 | `dim_product` | Kitab: ad, standart kateqoriya, kataloq qiyməti, `is_known` |
 | `dim_date` | Təqvim: `date_key` (YYYYMMDD), il, rüb, ay, `year_month`, həftə günü, həftə sonu |
-| `rejected_orders` | Karantinə düşən xam sətirlər və səbəb (`reason`) |
+| `rejected_orders` | Karantinə düşən xam sətirlər və səbəb (`reason`). Açar: `(source_file, source_row)`, ona görə boş `order_id`-li sətirlər də itmir və təkrar yükləmə ikiləşmə yaratmır |
 
 **Niyə belə:**
 - Ulduz sxemi analitika üçün standartdır. Rəqəmlər (miqdar, məbləğ) faktda, təsvir (şəhər, kateqoriya, ay) ölçülərdədir. Bütün suallar 1-2 JOIN ilə yazılır.
@@ -141,12 +147,14 @@ rejected_orders   (karantin: təmizləmədən keçməyən sətirlər)
 ## İdempotentlik və inkremental yükləmə
 
 - Bütün yükləmələr `INSERT ... ON CONFLICT (açar) DO UPDATE` (upsert) ilə edilir. Skript neçə dəfə işə salınsa da, sətir sayı dəyişmir. Bunu `tests/test_pipeline_db.py` yoxlayır.
-- Sətir yalnız nəsə həqiqətən dəyişəndə yenilənir (`IS DISTINCT FROM`). Bu zaman `updated_at` dəyişir. Log hər fayl üçün "yeni / yeniləndi / rədd edildi" saylarını göstərir:
+- `updated_at` yalnız nəsə həqiqətən dəyişəndə yenilənir (`IS DISTINCT FROM`). Log hər fayl üçün "yeni / yeniləndi / rədd edildi" saylarını göstərir:
   ```
   orders_2026_08_10.csv: oxundu 2425, yeni 2382, yeniləndi 0, rədd edildi 18
   orders_2026_11_01.csv: oxundu 68, yeni 60, yeniləndi 8, rədd edildi 0
   ```
-- Köhnə fayl yenidən yüklənəndə yeni statusu geri qaytarmasın deyə şərt var: `EXCLUDED.source_file >= fact_orders.source_file`. Fayllar tarixlə adlandığı üçün əlifba sırası xronoloji sıraya bərabərdir. Yəni noyabr faylından sonra `load` yenidən işə salınsa, `refunded` statusu `completed`-ə qayıtmır (bu da testdə yoxlanılır).
+- Köhnə fayl yenidən yüklənəndə yeni statusu geri qaytarmasın deyə şərt var: `EXCLUDED.source_file >= fact_orders.source_file`. Fayllar tarixlə adlandığı üçün əlifba sırası xronoloji sıraya bərabərdir. Yəni noyabr faylından sonra `load` yenidən işə salınsa, `refunded` statusu `completed`-ə qayıtmır. Sifariş daha yeni faylda dəyişmədən təkrarlansa belə, `source_file` ən yeni fayla keçir. Beləliklə aradakı tarixli köhnə fayl da onu əzə bilmir (hər ikisi testdə yoxlanılır).
+- `--reset` cədvəlləri yükləmə ilə eyni tranzaksiyada silir. Yükləmə uğursuz olsa (məs. fayl tapılmasa), rollback köhnə məlumatı geri qaytarır.
+- `docker compose` PostgreSQL portunu yalnız `127.0.0.1`-də açır. Şifrə (`postgres`) yalnız lokal inkişaf üçündür.
 
 ## Keyfiyyət yoxlamaları
 
